@@ -96,7 +96,7 @@ def load_state():
     """Loads the bot state from the context file."""
     if not Path(CONTEXT_FILE).exists():
         logging.info(f"Context file not found. Creating a new one at: {CONTEXT_FILE}")
-        return {"contexts": {}, "last_update_id": 0, "prompt_counters": {}, "context_workflows": {}, "awaiting_input": {}}
+        return {"contexts": {}, "last_update_id": 0, "prompt_counters": {}, "context_workflows": {}, "awaiting_input": {}, "force_new_session": {}}
     try:
         with open(CONTEXT_FILE, 'r') as f:
             state = json.load(f)
@@ -104,6 +104,7 @@ def load_state():
             state.setdefault("prompt_counters", {})
             state.setdefault("context_workflows", {})
             state.setdefault("awaiting_input", {})
+            state.setdefault("force_new_session", {})
             return state
     except (json.JSONDecodeError, FileNotFoundError):
         logging.error(f"Could not read or parse {CONTEXT_FILE}. Starting fresh.")
@@ -565,6 +566,66 @@ def handle_kill_processes(chat_id):
 
     send_message(chat_id, response_message)
 
+def handle_clear_session(chat_id, state):
+    """Handles the /clear command to delete all sessions for the current project using the CLI."""
+    project_context = state["contexts"].get(str(chat_id))
+    if not project_context:
+        send_message(chat_id, "No project context set. Please use `/set_project <project_name>` first.")
+        return
+
+    send_message(chat_id, "🧹 Scanning for sessions to clear...")
+    
+    gemini_executable = shutil.which("gemini")
+    if not gemini_executable:
+        send_message(chat_id, "Error: `gemini` executable not found.")
+        return
+
+    try:
+        # List sessions
+        result = subprocess.run(
+            [gemini_executable, "--list-sessions"],
+            cwd=project_context,
+            capture_output=True,
+            text=True
+        )
+        
+        # Parse output for session UUIDs (format: [UUID])
+        # Regex to match UUIDs inside brackets
+        session_ids = re.findall(r'\[([0-9a-fA-F-]{36})\]', result.stdout)
+        
+        if not session_ids:
+             send_message(chat_id, "ℹ️ No active sessions found to clear.")
+             return
+             
+        count = 0
+        for sess_id in session_ids:
+             del_res = subprocess.run(
+                 [gemini_executable, "--delete-session", sess_id],
+                 cwd=project_context,
+                 capture_output=True,
+                 text=True
+             )
+             if del_res.returncode == 0:
+                 count += 1
+             else:
+                 logging.warning(f"Failed to delete session {sess_id}: {del_res.stderr}")
+
+        if count > 0:
+            send_message(chat_id, f"🧹 **Session history deleted!**\nCleared {count} old session(s).")
+        else:
+            send_message(chat_id, "ℹ️ No active sessions found to delete.")
+            
+    except Exception as e:
+        error_msg = f"❌ Error clearing sessions: {e}"
+        logging.error(error_msg)
+        send_message(chat_id, error_msg)
+
+def handle_new_command(chat_id, state):
+    """Handles the /new command to force a fresh session for the next message."""
+    state.setdefault("force_new_session", {})[chat_id] = True
+    save_state(state)
+    send_message(chat_id, "✨ **Ready!**\nYour next message will start a brand new conversation context (old sessions are preserved).")
+
 
 def send_file_with_content(chat_id, file_path):
     """Sends the file content and as a file attachment."""
@@ -731,6 +792,151 @@ def update_gemini_md(project_path, user_request=None, agent_response=None):
     except IOError as e:
         logging.error(f"Could not write to {gemini_md_path}: {e}")
 
+def run_gemini_streaming(chat_id, command, project_context, state):
+    """Executes Gemini CLI and streams the output to Telegram."""
+    logging.info(f"Executing Gemini CLI (Streaming): {' '.join(command)}")
+    
+    # Send initial "Thinking..." message
+    initial_msg_response = requests.post(
+        f"{TELEGRAM_API_URL}/sendMessage",
+        data={'chat_id': chat_id, 'text': "_Gemini is thinking..._", 'parse_mode': 'Markdown'}
+    )
+    
+    message_id = None
+    if initial_msg_response.status_code == 200:
+        message_id = initial_msg_response.json()['result']['message_id']
+    else:
+        logging.error(f"Failed to send initial message: {initial_msg_response.text}")
+        return
+
+    process = subprocess.Popen(
+        command,
+        cwd=project_context,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding='utf-8',
+        bufsize=0  # Unbuffered
+    )
+
+    full_output = ""
+    last_update_time = time.time()
+    update_interval = 1.5  # Seconds between Telegram updates
+    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+
+    try:
+        # Read stdout character by character to catch streaming output
+        while True:
+            char = process.stdout.read(1)
+            if not char and process.poll() is not None:
+                break
+            
+            if char:
+                full_output += char
+                
+                # Check if it's time to update Telegram
+                if time.time() - last_update_time > update_interval:
+                    clean_output = ansi_escape.sub('', full_output)
+                    if clean_output.strip():
+                        # Basic formatting preservation
+                        formatted_text = clean_output + " ▌" # Cursor effect
+                        # Truncate if too long (Telegram limit is 4096)
+                        if len(formatted_text) > 4000:
+                             formatted_text = formatted_text[-4000:]
+                        
+                        try:
+                            requests.post(
+                                f"{TELEGRAM_API_URL}/editMessageText",
+                                data={
+                                    'chat_id': chat_id, 
+                                    'message_id': message_id, 
+                                    'text': formatted_text, 
+                                    # 'parse_mode': 'Markdown' # Disable MD during stream to avoid broken syntax errors
+                                }
+                            )
+                        except Exception as e:
+                            logging.debug(f"Update skipped: {e}")
+                        
+                        last_update_time = time.time()
+
+        # Capture any remaining stderr
+        stderr_output = process.stderr.read()
+        if stderr_output:
+            full_output += f"\n\n--- STDERR ---\n{stderr_output}"
+
+        # Final Cleanup and Formatting
+        clean_output = ansi_escape.sub('', full_output)
+        
+        # Save to logs
+        conversation_log_path = Path(project_context) / "project_conversation.log"
+        try:
+            with open(conversation_log_path, 'a', encoding='utf-8') as f:
+                f.write(f"\n--- AGENT DECISION ---\n{full_output}\n")
+        except IOError as e:
+            logging.error(f"Could not write agent decision to log: {e}")
+
+        update_gemini_md(project_context, agent_response=clean_output)
+
+        # Final Message Update with proper formatting
+        final_text = clean_output.strip()
+        if not final_text:
+            final_text = "_Gemini CLI returned an empty response._"
+
+        # Apply Telegram Markdown formatting
+        formatted_final = format_for_telegram_paragraphs(break_sentences_into_lines(final_text))
+        
+        # If output is too long, we might need to split it, but editMessageText can't split.
+        # So we edit the first part and send new messages for the rest.
+        max_len = 4096
+        parts = [formatted_final[i:i + max_len] for i in range(0, len(formatted_final), max_len)]
+
+        if parts:
+            # Update the existing message with the first part
+            try:
+                res = requests.post(
+                    f"{TELEGRAM_API_URL}/editMessageText",
+                    data={
+                        'chat_id': chat_id,
+                        'message_id': message_id,
+                        'text': parts[0],
+                        'parse_mode': 'Markdown'
+                    }
+                )
+                if not res.json().get("ok"):
+                    raise Exception(f"API Error: {res.text}")
+            except Exception as e:
+                logging.warning(f"Markdown send failed, falling back to plain text: {e}")
+                # Fallback: Try sending without Parse Mode (Plain Text)
+                requests.post(
+                    f"{TELEGRAM_API_URL}/editMessageText",
+                    data={
+                        'chat_id': chat_id,
+                        'message_id': message_id,
+                        'text': parts[0]
+                        # No parse_mode
+                    }
+                )
+
+            # Send remaining parts as new messages
+            for part in parts[1:]:
+                try:
+                    send_message(chat_id, part, "Markdown")
+                except:
+                    send_message(chat_id, part, "") # Fallback for remaining parts too
+
+        # Check for files to display
+        match = re.search(r'`([^`\n]+)`', clean_output)
+        if match:
+            filename = match.group(1)
+            file_path = Path(project_context) / filename
+            if file_path.is_file():
+                send_file_with_content(chat_id, file_path)
+
+    except Exception as e:
+        logging.error(f"Error in streaming: {e}")
+        send_message(chat_id, f"Error during execution: {e}")
+
+
 def handle_gemini_prompt(chat_id, text, state):
     """Handles a regular message as a prompt to Gemini CLI."""
     project_context = state["contexts"].get(str(chat_id))
@@ -744,50 +950,58 @@ def handle_gemini_prompt(chat_id, text, state):
     
     update_gemini_md(project_context, user_request=text)
 
-    send_message(chat_id, f"Processing your request in project `{project_context}`...")
+    # send_message(chat_id, f"Processing your request in project `{project_context}`...") # Removed to reduce noise
     conversation_log_path = Path(project_context) / "project_conversation.log"
 
     try:
         with open(conversation_log_path, 'a', encoding='utf-8') as f:
             f.write(f"\n--- USER REQUEST ---\n{text}\n")
-        logging.info(f"Appended user request to {conversation_log_path}")
     except IOError as e:
         logging.error(f"Could not write to {conversation_log_path}: {e}")
 
     # Prepare Gemini command
     gemini_executable = shutil.which("gemini")
     if not gemini_executable:
-        gemini_output = "Error: `gemini` command not found. Is gemini-cli installed and in the system's PATH?"
-        logging.error(gemini_output)
-        send_message(chat_id, gemini_output)
+        send_message(chat_id, "Error: `gemini` command not found.")
         return
 
-    command = [gemini_executable, "--yolo", "--resume", "latest", "--prompt", text]
+    command = [gemini_executable, "--yolo"]
+    
+    # Check if we should force a new session
+    force_new = state.get("force_new_session", {}).get(str(chat_id), False)
+    
+    if force_new:
+        logging.info("Force new session flag detected. Starting fresh session.")
+        # Consume the flag
+        if str(chat_id) in state.get("force_new_session", {}):
+            del state["force_new_session"][str(chat_id)]
+            save_state(state)
+    else:
+        # Check if a session exists using CLI
+        try:
+            check_res = subprocess.run(
+                [gemini_executable, "--list-sessions"],
+                cwd=project_context,
+                capture_output=True,
+                text=True
+            )
+            # If output contains at least one bracketed UUID, assume sessions exist
+            if "[" in check_res.stdout and "]" in check_res.stdout:
+                 command.extend(["--resume", "latest"])
+            else:
+                 logging.info(f"No active sessions found (CLI check), starting fresh.")
+        except Exception as e:
+            logging.warning(f"Failed to check sessions: {e}. Defaulting to fresh session.")
+
+    command.extend(["--prompt", text])
+    
     if DEBUG_MODE:
         command.append("--debug")
 
-    logging.info(f"Executing Gemini CLI with command: {' '.join(command)}")
-    
-    try:
-        process = subprocess.Popen(
-            command,
-            cwd=project_context,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding='utf-8'
-        )
-        running_processes.append({
-            "process": process,
-            "chat_id": str(chat_id),
-            "project_context": project_context,
-            "start_time": time.time()
-        })
-    except Exception as e:
-        error_message = f"An unexpected error occurred while starting Gemini CLI: {e}"
-        logging.error(error_message)
-        send_message(chat_id, error_message)
-        return
+    # Start streaming in a separate thread
+    thread = threading.Thread(target=run_gemini_streaming, args=(chat_id, command, project_context, state))
+    thread.daemon = True
+    thread.start()
 
     # Send periodic reminder
     if prompt_counter % 5 == 0:
@@ -796,157 +1010,6 @@ def handle_gemini_prompt(chat_id, text, state):
             f"you may want to refine the context soon using the `/context` command."
         )
         send_message(chat_id, reminder_message)
-
-def handle_context_command(chat_id, state):
-    """Handles the /context command to start the refinement workflow."""
-    project_context = state["contexts"].get(str(chat_id))
-    if not project_context:
-        send_message(chat_id, "No project context set. Please use `/set_project <project_name>` first.")
-        return
-
-    gemini_md_path = Path(project_context) / "GEMINI.md"
-    if not gemini_md_path.is_file():
-        send_message(chat_id, "Error: `GEMINI.md` not found in the current project.")
-        return
-
-    send_message(chat_id, "Here is the current `GEMINI.md` for your reference:")
-    send_file(chat_id, gemini_md_path)
-    send_message(chat_id, "_Preparing a refined version..._")
-
-    try:
-        current_content = gemini_md_path.read_text(encoding='utf-8')
-        prompt = (
-            "Please review and consolidate the following project requirements into a concise and updated version. "
-            f"Return only the updated markdown content.\n\n---\n\n{current_content}"
-        )
-        
-        gemini_executable = shutil.which("gemini")
-        if not gemini_executable:
-            send_message(chat_id, "Error: `gemini` command not found. Is gemini-cli installed and in the system's PATH?")
-            return
-
-        command = [gemini_executable, "--yolo", "--prompt", prompt]
-        result = subprocess.run(
-            command,
-            cwd=project_context,
-            capture_output=True,
-            text=True,
-            timeout=300,
-            check=True
-        )
-        
-        ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-        proposed_text = ansi_escape.sub('', result.stdout)
-
-        state["context_workflows"][chat_id] = {
-            "state": "awaiting_decision",
-            "proposed_text": proposed_text
-        }
-
-        send_message(chat_id, "*Agent's Proposed Update for `GEMINI.md`*")
-        # Use HTML for preformatted block
-        escaped_proposal = proposed_text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-        send_message(chat_id, f"<pre><code>{escaped_proposal}</code></pre>", "HTML")
-
-        options_message = (
-            "What would you like to do?\n\n"
-            "1. *Accept*: Overwrite the file with this proposal.\n"
-            "2. *Suggest Edits*: Reply with your changes.\n"
-            "3. *Decline*: Cancel the operation.\n"
-            "4. *Upload File*: Send your own `GEMINI.md` to use."
-        )
-        send_message(chat_id, options_message)
-
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-        send_message(chat_id, f"Error generating refined context: {e}")
-    except Exception as e:
-        send_message(chat_id, f"An unexpected error occurred: {e}")
-        logging.error(f"Error in /context command: {e}", exc_info=True)
-
-# --- Gemini Process Management ---
-
-running_processes = []
-GEMINI_TIMEOUT = 300  # 5 minutes
-
-def process_gemini_result(process_info, returncode, stdout, stderr, state):
-    """Processes the output of a completed Gemini CLI process."""
-    chat_id = process_info['chat_id']
-    project_context = process_info['project_context']
-    
-    gemini_output = stdout
-    if returncode != 0:
-        gemini_output += f"\n\n--- STDERR ---\n{stderr}"
-
-    logging.info(f"--- RAW GEMINI OUTPUT (PID: {process_info['process'].pid}) ---\n{gemini_output}\n--- END RAW GEMINI OUTPUT ---")
-
-    conversation_log_path = Path(project_context) / "project_conversation.log"
-    try:
-        with open(conversation_log_path, 'a', encoding='utf-8') as f:
-            f.write(f"\n--- AGENT DECISION ---\n{gemini_output}\n")
-        logging.info(f"Appended agent decision to {conversation_log_path}")
-    except IOError as e:
-        logging.error(f"Could not write agent decision to {conversation_log_path}: {e}")
-
-    # Clean ANSI escape codes for Telegram
-    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-    telegram_output = ansi_escape.sub('', gemini_output)
-
-    if returncode == 0:
-        update_gemini_md(project_context, agent_response=telegram_output)
-
-    # Send the Gemini response first
-    if not telegram_output.strip():
-        send_message(chat_id, "_Gemini CLI returned an empty response._")
-    else:
-        # Break sentences into new lines before formatting paragraphs
-        telegram_output_with_line_breaks = break_sentences_into_lines(telegram_output)
-        formatted_output = format_for_telegram_paragraphs(telegram_output_with_line_breaks)
-        # Send as a regular message with Markdown parsing
-        max_len = 4096  # Max length for a Telegram message
-        for i in range(0, len(formatted_output), max_len):
-            chunk = formatted_output[i:i + max_len]
-            send_message(chat_id, chunk, "Markdown")
-
-    # After sending the response, check for filenames to auto-display content
-    match = re.search(r'`([^`\n]+)`', telegram_output)
-    if match:
-        filename = match.group(1)
-        file_path = Path(project_context) / filename
-        if file_path.is_file():
-            logging.info(f"Extracted filename '{filename}' from response. Sending file content.")
-            send_file_with_content(chat_id, file_path)
-        else:
-            logging.warning(f"File '{filename}' mentioned in response not found at: {file_path}")
-
-def check_running_processes(state):
-    """Checks for and handles completed/timed-out Gemini processes."""
-    global running_processes
-    completed_indices = []
-    for i, p_info in enumerate(running_processes):
-        process = p_info['process']
-        if process.poll() is not None:  # Process finished
-            stdout, stderr = process.communicate()
-            logging.info(f"Gemini CLI process {process.pid} finished with exit code: {process.returncode}")
-            process_gemini_result(p_info, process.returncode, stdout, stderr, state)
-            completed_indices.append(i)
-        elif time.time() - p_info['start_time'] > GEMINI_TIMEOUT:
-            logging.warning(f"Gemini CLI process {process.pid} timed out. Terminating.")
-            process.terminate()
-            try:
-                stdout, stderr = process.communicate(timeout=10)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                stdout, stderr = process.communicate()
-            
-            error_message = "Error: Gemini CLI command timed out after 5 minutes."
-            send_message(p_info['chat_id'], error_message)
-            # Still process the (likely empty) output to log it
-            process_gemini_result(p_info, -1, stdout, stderr, state)
-            completed_indices.append(i)
-
-    # Remove completed processes from list (in reverse order to not mess up indices)
-    for i in sorted(completed_indices, reverse=True):
-        del running_processes[i]
 
 
 # --- File System Observer ---
@@ -1220,6 +1283,10 @@ def main():
                     handle_download_project(chat_id, state)
                 elif text.startswith("/k"):
                     handle_kill_processes(chat_id)
+                elif text == "/clear":
+                    handle_clear_session(chat_id, state)
+                elif text == "/new":
+                    handle_new_command(chat_id, state)
                 elif text == "/context":
                     handle_context_command(chat_id, state)
                 elif text == "/current_project":
@@ -1229,8 +1296,6 @@ def main():
                     handle_gemini_prompt(chat_id, text, state)
 
                 save_state(state)
-
-            check_running_processes(state)
 
         except requests.exceptions.RequestException as e:
             logging.error(f"Network error during getUpdates: {e}. Retrying in 2 seconds...")
