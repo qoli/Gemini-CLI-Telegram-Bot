@@ -762,7 +762,7 @@ def handle_gemini_prompt(chat_id, text, state):
         send_message(chat_id, gemini_output)
         return
 
-    command = [gemini_executable, "--yolo", "--checkpointing", "--prompt", text]
+    command = [gemini_executable, "--yolo", "--resume", "latest", "--prompt", text]
     if DEBUG_MODE:
         command.append("--debug")
 
