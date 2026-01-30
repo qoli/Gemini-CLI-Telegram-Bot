@@ -39,6 +39,7 @@ import shutil
 import subprocess
 import time
 import threading
+from queue import Queue, Empty
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -78,6 +79,14 @@ LOG_FILE = "telegram-bot.log"
 # Telegram API URL
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
+# Streaming configuration
+STREAM_MODE = os.getenv("STREAM_MODE", "partial").lower()  # partial | block | off
+STREAM_UPDATE_INTERVAL = float(os.getenv("STREAM_UPDATE_INTERVAL", "1.5"))
+STREAM_MIN_CHARS = int(os.getenv("STREAM_MIN_CHARS", "200"))
+STREAM_MAX_CHARS = int(os.getenv("STREAM_MAX_CHARS", "800"))
+STREAM_TAIL_LIMIT = int(os.getenv("STREAM_TAIL_LIMIT", "3800"))
+STREAM_CURSOR = os.getenv("STREAM_CURSOR", " ▌")
+
 # --- Logging Setup ---
 
 logging.basicConfig(
@@ -91,6 +100,8 @@ logging.basicConfig(
 )
 
 # --- State Management ---
+
+LAST_THREAD_ID = {}
 
 def load_state():
     """Loads the bot state from the context file."""
@@ -180,7 +191,7 @@ def format_for_telegram_paragraphs(text):
     
     return "".join(parts)
 
-def send_message(chat_id, text, parse_mode="Markdown"):
+def send_message(chat_id, text, parse_mode="Markdown", message_thread_id=None):
     """Sends a text message to a Telegram chat."""
     logging.info(f"Sending message to Chat ID: {chat_id}")
     if not text:
@@ -190,11 +201,17 @@ def send_message(chat_id, text, parse_mode="Markdown"):
     if parse_mode == "Markdown":
         text = format_for_telegram(text)
 
+    if message_thread_id is None:
+        message_thread_id = LAST_THREAD_ID.get(str(chat_id))
+
     payload = {
         'chat_id': chat_id,
-        'text': text,
-        'parse_mode': parse_mode
+        'text': text
     }
+    if message_thread_id is not None:
+        payload['message_thread_id'] = message_thread_id
+    if parse_mode:
+        payload['parse_mode'] = parse_mode
     try:
         response = requests.post(f"{TELEGRAM_API_URL}/sendMessage", data=payload, timeout=30)
         response.raise_for_status()
@@ -206,19 +223,107 @@ def send_message(chat_id, text, parse_mode="Markdown"):
     except requests.exceptions.RequestException as e:
         logging.error(f"Error sending message to Chat ID: {chat_id}. Request failed: {e}")
 
-def send_file(chat_id, file_path):
+def send_message_raw(chat_id, text, message_thread_id=None):
+    """Sends a plain text message and returns message_id on success."""
+    if not text:
+        return None
+    if message_thread_id is None:
+        message_thread_id = LAST_THREAD_ID.get(str(chat_id))
+    payload = {
+        'chat_id': chat_id,
+        'text': text
+    }
+    if message_thread_id is not None:
+        payload['message_thread_id'] = message_thread_id
+    try:
+        response = requests.post(f"{TELEGRAM_API_URL}/sendMessage", data=payload, timeout=30)
+        response.raise_for_status()
+        response_json = response.json()
+        if response_json.get("ok"):
+            return response_json.get("result", {}).get("message_id")
+        logging.error(f"Error in Telegram API response when sending raw message: {response_json}")
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Error sending raw message to Chat ID: {chat_id}. Request failed: {e}")
+    return None
+
+def send_message_with_id(chat_id, text, parse_mode=None, message_thread_id=None):
+    """Sends a message and returns message_id on success."""
+    if not text:
+        return None
+    if parse_mode == "Markdown":
+        text = format_for_telegram(text)
+    if message_thread_id is None:
+        message_thread_id = LAST_THREAD_ID.get(str(chat_id))
+    payload = {
+        'chat_id': chat_id,
+        'text': text
+    }
+    if message_thread_id is not None:
+        payload['message_thread_id'] = message_thread_id
+    if parse_mode:
+        payload['parse_mode'] = parse_mode
+    try:
+        response = requests.post(f"{TELEGRAM_API_URL}/sendMessage", data=payload, timeout=30)
+        response.raise_for_status()
+        response_json = response.json()
+        if response_json.get("ok"):
+            return response_json.get("result", {}).get("message_id")
+        logging.error(f"Error in Telegram API response when sending message: {response_json}")
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Error sending message to Chat ID: {chat_id}. Request failed: {e}")
+    return None
+
+def edit_message_text(chat_id, message_id, text, parse_mode=None):
+    """Edits a Telegram message. Returns True on success."""
+    if not text:
+        return False
+    payload = {
+        'chat_id': chat_id,
+        'message_id': message_id,
+        'text': text
+    }
+    if parse_mode:
+        payload['parse_mode'] = parse_mode
+
+    try:
+        response = requests.post(f"{TELEGRAM_API_URL}/editMessageText", data=payload, timeout=30)
+        if response.status_code == 429:
+            try:
+                retry_after = response.json().get("parameters", {}).get("retry_after", 1)
+            except Exception:
+                retry_after = 1
+            time.sleep(min(retry_after, 5))
+            return False
+        response.raise_for_status()
+        response_json = response.json()
+        if response_json.get("ok"):
+            return True
+        description = response_json.get("description", "")
+        if "message is not modified" in description.lower():
+            return True
+        logging.debug(f"Edit message failed: {response_json}")
+        return False
+    except requests.exceptions.RequestException as e:
+        logging.debug(f"Edit message request failed: {e}")
+        return False
+
+def send_file(chat_id, file_path, message_thread_id=None):
     """Sends a file to a Telegram chat."""
     logging.info(f"Sending file to Chat ID: {chat_id}, File: {file_path}")
     file_path = Path(file_path)  # Ensure file_path is a Path object
     if not file_path.is_file():
         logging.error(f"File not found for sending: {file_path}")
-        send_message(chat_id, f"Error: Could not find file `{file_path.name}` on the server.")
+        send_message(chat_id, f"Error: Could not find file `{file_path.name}` on the server.", message_thread_id=message_thread_id)
         return
         
     try:
         with open(file_path, 'rb') as f:
             files = {'document': f}
             payload = {'chat_id': chat_id}
+            if message_thread_id is None:
+                message_thread_id = LAST_THREAD_ID.get(str(chat_id))
+            if message_thread_id is not None:
+                payload['message_thread_id'] = message_thread_id
             response = requests.post(f"{TELEGRAM_API_URL}/sendDocument", data=payload, files=files, timeout=60)
             response.raise_for_status()
             response_json = response.json()
@@ -228,7 +333,7 @@ def send_file(chat_id, file_path):
                 logging.error(f"Error in Telegram API response when sending file: {response_json}")
     except requests.exceptions.RequestException as e:
         logging.error(f"Error sending file to Chat ID: {chat_id}. Request failed: {e}")
-        send_message(chat_id, f"An error occurred while sending the file `{file_path.name}`.")
+        send_message(chat_id, f"An error occurred while sending the file `{file_path.name}`.", message_thread_id=message_thread_id)
 
 # --- Icon Helper ---
 
@@ -255,7 +360,7 @@ def get_file_icon(filename):
 
 # --- Command Handlers ---
 
-def set_project(chat_id, project_name, state, initial_prompt=None):
+def set_project(chat_id, project_name, state, initial_prompt=None, message_thread_id=None):
     """Sets the project context for a given chat and returns status and message."""
     project_path = Path(PROJECTS_DIR) / project_name
     logging.info(f"Attempting to set project path to: {project_path}")
@@ -271,7 +376,7 @@ def set_project(chat_id, project_name, state, initial_prompt=None):
 
         if initial_prompt:
             logging.info(f"Handling initial prompt for selected project: {initial_prompt}")
-            handle_gemini_prompt(chat_id, initial_prompt, state)
+            handle_gemini_prompt(chat_id, initial_prompt, state, message_thread_id=message_thread_id)
         
         message_text = f"Project context set to: `{project_path}`"
         return True, message_text
@@ -279,7 +384,7 @@ def set_project(chat_id, project_name, state, initial_prompt=None):
         message_text = f"Error: Project `{project_name}` not found in `{PROJECTS_DIR}`."
         return False, message_text
 
-def handle_set_project(chat_id, text, state):
+def handle_set_project(chat_id, text, state, message_thread_id=None):
     """Handles the /set_project command."""
     parts = text.split()
     if len(parts) < 2:
@@ -299,6 +404,9 @@ def handle_set_project(chat_id, text, state):
                 'text': "Select a project:",
                 'reply_markup': json.dumps(keyboard)
             }
+            thread_id = LAST_THREAD_ID.get(str(chat_id))
+            if thread_id is not None:
+                payload['message_thread_id'] = thread_id
             response = requests.post(f"{TELEGRAM_API_URL}/sendMessage", data=payload, timeout=30)
             response.raise_for_status()
         except Exception as e:
@@ -308,10 +416,10 @@ def handle_set_project(chat_id, text, state):
 
     project_name = parts[1]
     initial_prompt = " ".join(parts[2:])
-    success, message = set_project(chat_id, project_name, state, initial_prompt)
-    send_message(chat_id, message)
+    success, message = set_project(chat_id, project_name, state, initial_prompt, message_thread_id=message_thread_id)
+    send_message(chat_id, message, message_thread_id=message_thread_id)
 
-def create_new_project(chat_id, project_name, state, initial_prompt=None):
+def create_new_project(chat_id, project_name, state, initial_prompt=None, message_thread_id=None):
     """Creates a new project directory and sets it as the current context."""
     project_path = Path(PROJECTS_DIR) / project_name
     logging.info(f"Checking if project path exists: {project_path}")
@@ -328,26 +436,26 @@ def create_new_project(chat_id, project_name, state, initial_prompt=None):
             else:
                 logging.warning(f"Gemini settings file not found at '{GEMINI_SETTINGS_FILE}'. Skipping copy.")
             state["contexts"][str(chat_id)] = str(project_path)
-            send_message(chat_id, f"Project `{project_name}` created and context set to: `{project_path}`")
+            send_message(chat_id, f"Project `{project_name}` created and context set to: `{project_path}`", message_thread_id=message_thread_id)
             start_file_observer(chat_id, str(project_path))
 
             if initial_prompt:
                 logging.info(f"Handling initial prompt for new project: {initial_prompt}")
-                handle_gemini_prompt(chat_id, initial_prompt, state)
+                handle_gemini_prompt(chat_id, initial_prompt, state, message_thread_id=message_thread_id)
 
         except OSError as e:
             logging.error(f"Failed to create project directory {project_path}: {e}")
             send_message(chat_id, f"Error: Could not create project directory. Check server permissions.")
 
-def handle_new_project(chat_id, text, state):
+def handle_new_project(chat_id, text, state, message_thread_id=None):
     """Handles the /new_project command."""
     parts = text.split()
     if len(parts) < 2:
-        send_message(chat_id, "Usage: `/new_project <project_name> [initial_prompt]`")
+        send_message(chat_id, "Usage: `/new_project <project_name> [initial_prompt]`", message_thread_id=message_thread_id)
         return
     project_name = parts[1]
     initial_prompt = " ".join(parts[2:])
-    create_new_project(chat_id, project_name, state, initial_prompt)
+    create_new_project(chat_id, project_name, state, initial_prompt, message_thread_id=message_thread_id)
 
 
 def execute_file(chat_id, project_context, filename, params):
@@ -458,6 +566,9 @@ def handle_e_command(chat_id, state):
             'text': "Select a file to view and execute:",
             'reply_markup': json.dumps(keyboard)
         }
+        thread_id = LAST_THREAD_ID.get(str(chat_id))
+        if thread_id is not None:
+            payload['message_thread_id'] = thread_id
         response = requests.post(f"{TELEGRAM_API_URL}/sendMessage", data=payload, timeout=30)
         response.raise_for_status()
     except Exception as e:
@@ -490,6 +601,9 @@ def handle_get_file(chat_id, text, state):
                 'text': "Select a file to view:",
                 'reply_markup': json.dumps(keyboard)
             }
+            thread_id = LAST_THREAD_ID.get(str(chat_id))
+            if thread_id is not None:
+                payload['message_thread_id'] = thread_id
             response = requests.post(f"{TELEGRAM_API_URL}/sendMessage", data=payload, timeout=30)
             response.raise_for_status()
         except Exception as e:
@@ -627,7 +741,7 @@ def handle_new_command(chat_id, state):
     send_message(chat_id, "✨ **Ready!**\nYour next message will start a brand new conversation context (old sessions are preserved).")
 
 
-def send_file_with_content(chat_id, file_path):
+def send_file_with_content(chat_id, file_path, message_thread_id=None):
     """Sends the file content and as a file attachment."""
     try:
         try:
@@ -645,7 +759,7 @@ def send_file_with_content(chat_id, file_path):
             max_len = 4096  # Max length for a Telegram message
             for i in range(0, len(content), max_len):
                 chunk = content[i:i + max_len]
-                send_message(chat_id, chunk, parse_mode)
+                send_message(chat_id, chunk, parse_mode, message_thread_id=message_thread_id)
         else:
             # For other files, wrap in a code block
             parse_mode = "HTML"
@@ -653,19 +767,22 @@ def send_file_with_content(chat_id, file_path):
             max_len = 4080  # Max length for content inside <pre><code> tags
             for i in range(0, len(escaped_content), max_len):
                 chunk = escaped_content[i:i + max_len]
-                send_message(chat_id, f"<pre><code>{chunk}</code></pre>", parse_mode)
+                send_message(chat_id, f"<pre><code>{chunk}</code></pre>", parse_mode, message_thread_id=message_thread_id)
 
         # Always send the file as an attachment as well
-        send_file(chat_id, file_path)
+        send_file(chat_id, file_path, message_thread_id=message_thread_id)
     except Exception as e:
         logging.error(f"Error sending file with content: {e}")
         # If reading fails, just send the file as an attachment
-        send_file(chat_id, file_path)
+        send_file(chat_id, file_path, message_thread_id=message_thread_id)
 
 def handle_callback_query(callback_query, state):
     """Handles callback queries from inline keyboards."""
     callback_id = callback_query['id']
     chat_id = str(callback_query['message']['chat']['id'])
+    thread_id = callback_query.get('message', {}).get('message_thread_id')
+    if thread_id is not None:
+        LAST_THREAD_ID[chat_id] = thread_id
     data = callback_query['data']
     message_id = callback_query['message']['message_id']
 
@@ -675,14 +792,14 @@ def handle_callback_query(callback_query, state):
         if project_context:
             file_path = Path(project_context) / filename
             if file_path.is_file():
-                send_file_with_content(chat_id, file_path)
+                send_file_with_content(chat_id, file_path, message_thread_id=thread_id)
             else:
-                send_message(chat_id, f"Error: File `{filename}` no longer exists.")
+                send_message(chat_id, f"Error: File `{filename}` no longer exists.", message_thread_id=thread_id)
         else:
-            send_message(chat_id, "Error: Project context not found.")
+            send_message(chat_id, "Error: Project context not found.", message_thread_id=thread_id)
     elif data.startswith("set_project:"):
         project_name = data.split(":", 1)[1]
-        success, message = set_project(chat_id, project_name, state)
+        success, message = set_project(chat_id, project_name, state, message_thread_id=thread_id)
         
         # Edit the original message (which had the buttons)
         payload = {
@@ -708,7 +825,7 @@ def handle_callback_query(callback_query, state):
         if project_context:
             file_path = Path(project_context) / filename
             if file_path.is_file():
-                send_file_with_content(chat_id, file_path)
+                send_file_with_content(chat_id, file_path, message_thread_id=thread_id)
                 
                 keyboard = {
                     "inline_keyboard": [
@@ -723,11 +840,13 @@ def handle_callback_query(callback_query, state):
                     'text': "Would you like to pass parameters?",
                     'reply_markup': json.dumps(keyboard)
                 }
+                if thread_id is not None:
+                    payload['message_thread_id'] = thread_id
                 requests.post(f"{TELEGRAM_API_URL}/sendMessage", data=payload)
             else:
-                send_message(chat_id, f"Error: File `{filename}` no longer exists.")
+                send_message(chat_id, f"Error: File `{filename}` no longer exists.", message_thread_id=thread_id)
         else:
-            send_message(chat_id, "Error: Project context not found.")
+            send_message(chat_id, "Error: Project context not found.", message_thread_id=thread_id)
         
         payload = {
             'chat_id': chat_id,
@@ -742,7 +861,7 @@ def handle_callback_query(callback_query, state):
         if project_context:
             execute_file(chat_id, project_context, filename, [])
         else:
-            send_message(chat_id, "Error: Project context not found.")
+            send_message(chat_id, "Error: Project context not found.", message_thread_id=thread_id)
         
         payload = {
             'chat_id': chat_id,
@@ -792,21 +911,23 @@ def update_gemini_md(project_path, user_request=None, agent_response=None):
     except IOError as e:
         logging.error(f"Could not write to {gemini_md_path}: {e}")
 
-def run_gemini_streaming(chat_id, command, project_context, state):
+def run_gemini_streaming(chat_id, command, project_context, state, message_thread_id=None):
     """Executes Gemini CLI and streams the output to Telegram."""
     logging.info(f"Executing Gemini CLI (Streaming): {' '.join(command)}")
+
+    stream_mode = STREAM_MODE if STREAM_MODE in {"partial", "block", "off"} else "partial"
+    if stream_mode != STREAM_MODE:
+        logging.warning(f"Invalid STREAM_MODE '{STREAM_MODE}', falling back to 'partial'.")
     
     # Send initial "Thinking..." message
-    initial_msg_response = requests.post(
-        f"{TELEGRAM_API_URL}/sendMessage",
-        data={'chat_id': chat_id, 'text': "_Gemini is thinking..._", 'parse_mode': 'Markdown'}
+    message_id = send_message_with_id(
+        chat_id,
+        "_Gemini is thinking..._",
+        parse_mode="Markdown",
+        message_thread_id=message_thread_id
     )
-    
-    message_id = None
-    if initial_msg_response.status_code == 200:
-        message_id = initial_msg_response.json()['result']['message_id']
-    else:
-        logging.error(f"Failed to send initial message: {initial_msg_response.text}")
+    if not message_id:
+        logging.error("Failed to send initial message for streaming.")
         return
 
     process = subprocess.Popen(
@@ -816,51 +937,116 @@ def run_gemini_streaming(chat_id, command, project_context, state):
         stderr=subprocess.PIPE,
         text=True,
         encoding='utf-8',
-        bufsize=0  # Unbuffered
+        bufsize=1  # Line-buffered
     )
+    logging.info(f"Gemini process started with PID: {process.pid}")
 
     full_output = ""
-    last_update_time = time.time()
-    update_interval = 1.5  # Seconds between Telegram updates
     ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+    last_update_time = time.time()
+    last_sent_text = ""
+    update_count = 0
+
+    stdout_clean = ""
+    block_buffer = ""
+    stderr_output = ""
+
+    queue = Queue()
+    stdout_done = False
+    stderr_done = False
+
+    def stream_reader(stream, label):
+        for chunk in iter(lambda: stream.read(512), ''):
+            if not chunk:
+                break
+            queue.put((label, chunk))
+        queue.put((label, None))
+
+    stdout_thread = threading.Thread(target=stream_reader, args=(process.stdout, "stdout"))
+    stderr_thread = threading.Thread(target=stream_reader, args=(process.stderr, "stderr"))
+    stdout_thread.daemon = True
+    stderr_thread.daemon = True
+    stdout_thread.start()
+    stderr_thread.start()
+
+    def maybe_update_partial(now):
+        nonlocal last_update_time, last_sent_text, update_count
+        if not stdout_clean:
+            return
+        if now - last_update_time < STREAM_UPDATE_INTERVAL:
+            return
+        visible = stdout_clean
+        if len(visible) > STREAM_TAIL_LIMIT:
+            visible = "…" + visible[-STREAM_TAIL_LIMIT:]
+        text = visible + STREAM_CURSOR
+        if text != last_sent_text and edit_message_text(chat_id, message_id, text):
+            last_sent_text = text
+            last_update_time = now
+            update_count += 1
+
+    def maybe_update_block(now, force_flush=False):
+        nonlocal last_update_time, last_sent_text, update_count, block_buffer, message_id
+        # Flush full chunks immediately
+        while len(block_buffer) >= STREAM_MAX_CHARS:
+            chunk = block_buffer[:STREAM_MAX_CHARS]
+            block_buffer = block_buffer[STREAM_MAX_CHARS:]
+            if edit_message_text(chat_id, message_id, chunk):
+                last_sent_text = chunk
+                last_update_time = now
+                update_count += 1
+            if process.poll() is None or block_buffer:
+                new_id = send_message_raw(chat_id, "…", message_thread_id=message_thread_id)
+                if new_id:
+                    message_id = new_id
+
+        if force_flush:
+            if block_buffer:
+                if edit_message_text(chat_id, message_id, block_buffer):
+                    last_sent_text = block_buffer
+                    last_update_time = now
+                    update_count += 1
+            return
+
+        if len(block_buffer) >= STREAM_MIN_CHARS and now - last_update_time >= STREAM_UPDATE_INTERVAL:
+            text = block_buffer + STREAM_CURSOR
+            if text != last_sent_text and edit_message_text(chat_id, message_id, text):
+                last_sent_text = text
+                last_update_time = now
+                update_count += 1
 
     try:
-        # Read stdout character by character to catch streaming output
         while True:
-            char = process.stdout.read(1)
-            if not char and process.poll() is not None:
-                break
-            
-            if char:
-                full_output += char
-                
-                # Check if it's time to update Telegram
-                if time.time() - last_update_time > update_interval:
-                    clean_output = ansi_escape.sub('', full_output)
-                    if clean_output.strip():
-                        # Basic formatting preservation
-                        formatted_text = clean_output + " ▌" # Cursor effect
-                        # Truncate if too long (Telegram limit is 4096)
-                        if len(formatted_text) > 4000:
-                             formatted_text = formatted_text[-4000:]
-                        
-                        try:
-                            requests.post(
-                                f"{TELEGRAM_API_URL}/editMessageText",
-                                data={
-                                    'chat_id': chat_id, 
-                                    'message_id': message_id, 
-                                    'text': formatted_text, 
-                                    # 'parse_mode': 'Markdown' # Disable MD during stream to avoid broken syntax errors
-                                }
-                            )
-                        except Exception as e:
-                            logging.debug(f"Update skipped: {e}")
-                        
-                        last_update_time = time.time()
+            try:
+                label, chunk = queue.get(timeout=0.1)
+            except Empty:
+                label = None
+                chunk = None
 
-        # Capture any remaining stderr
-        stderr_output = process.stderr.read()
+            if label == "stdout":
+                if chunk is None:
+                    stdout_done = True
+                else:
+                    full_output += chunk
+                    clean_chunk = ansi_escape.sub('', chunk)
+                    stdout_clean += clean_chunk
+                    block_buffer += clean_chunk
+            elif label == "stderr":
+                if chunk is None:
+                    stderr_done = True
+                else:
+                    stderr_output += chunk
+
+            now = time.time()
+            if stream_mode == "partial":
+                maybe_update_partial(now)
+            elif stream_mode == "block":
+                maybe_update_block(now)
+
+            if stdout_done and stderr_done and process.poll() is not None:
+                break
+
+        logging.info(f"Stream finished. Total length: {len(full_output)} chars. Total updates: {update_count}")
+
         if stderr_output:
             full_output += f"\n\n--- STDERR ---\n{stderr_output}"
 
@@ -876,6 +1062,12 @@ def run_gemini_streaming(chat_id, command, project_context, state):
             logging.error(f"Could not write agent decision to log: {e}")
 
         update_gemini_md(project_context, agent_response=clean_output)
+
+        if stream_mode == "block":
+            maybe_update_block(time.time(), force_flush=True)
+            if stderr_output.strip():
+                send_message(chat_id, f"--- STDERR ---\n{stderr_output}", "", message_thread_id=message_thread_id)
+            return
 
         # Final Message Update with proper formatting
         final_text = clean_output.strip()
@@ -893,36 +1085,20 @@ def run_gemini_streaming(chat_id, command, project_context, state):
         if parts:
             # Update the existing message with the first part
             try:
-                res = requests.post(
-                    f"{TELEGRAM_API_URL}/editMessageText",
-                    data={
-                        'chat_id': chat_id,
-                        'message_id': message_id,
-                        'text': parts[0],
-                        'parse_mode': 'Markdown'
-                    }
-                )
-                if not res.json().get("ok"):
-                    raise Exception(f"API Error: {res.text}")
+                res_ok = edit_message_text(chat_id, message_id, parts[0], parse_mode="Markdown")
+                if not res_ok:
+                    raise Exception("API Error: editMessageText failed")
             except Exception as e:
                 logging.warning(f"Markdown send failed, falling back to plain text: {e}")
                 # Fallback: Try sending without Parse Mode (Plain Text)
-                requests.post(
-                    f"{TELEGRAM_API_URL}/editMessageText",
-                    data={
-                        'chat_id': chat_id,
-                        'message_id': message_id,
-                        'text': parts[0]
-                        # No parse_mode
-                    }
-                )
+                edit_message_text(chat_id, message_id, parts[0])
 
             # Send remaining parts as new messages
             for part in parts[1:]:
                 try:
-                    send_message(chat_id, part, "Markdown")
+                    send_message(chat_id, part, "Markdown", message_thread_id=message_thread_id)
                 except:
-                    send_message(chat_id, part, "") # Fallback for remaining parts too
+                    send_message(chat_id, part, "", message_thread_id=message_thread_id) # Fallback for remaining parts too
 
         # Check for files to display
         match = re.search(r'`([^`\n]+)`', clean_output)
@@ -930,18 +1106,18 @@ def run_gemini_streaming(chat_id, command, project_context, state):
             filename = match.group(1)
             file_path = Path(project_context) / filename
             if file_path.is_file():
-                send_file_with_content(chat_id, file_path)
+                send_file_with_content(chat_id, file_path, message_thread_id=message_thread_id)
 
     except Exception as e:
         logging.error(f"Error in streaming: {e}")
-        send_message(chat_id, f"Error during execution: {e}")
+        send_message(chat_id, f"Error during execution: {e}", message_thread_id=message_thread_id)
 
 
-def handle_gemini_prompt(chat_id, text, state):
+def handle_gemini_prompt(chat_id, text, state, message_thread_id=None):
     """Handles a regular message as a prompt to Gemini CLI."""
     project_context = state["contexts"].get(str(chat_id))
     if not project_context:
-        send_message(chat_id, "No project context set. Please use `/set_project <project_name>` first.")
+        send_message(chat_id, "No project context set. Please use `/set_project <project_name>` first.", message_thread_id=message_thread_id)
         return
 
     # Increment and check the prompt counter
@@ -999,7 +1175,10 @@ def handle_gemini_prompt(chat_id, text, state):
         command.append("--debug")
 
     # Start streaming in a separate thread
-    thread = threading.Thread(target=run_gemini_streaming, args=(chat_id, command, project_context, state))
+    thread = threading.Thread(
+        target=run_gemini_streaming,
+        args=(chat_id, command, project_context, state, message_thread_id)
+    )
     thread.daemon = True
     thread.start()
 
@@ -1009,7 +1188,7 @@ def handle_gemini_prompt(chat_id, text, state):
             f"You've sent {prompt_counter} requests for this project. To keep the requirements concise, "
             f"you may want to refine the context soon using the `/context` command."
         )
-        send_message(chat_id, reminder_message)
+        send_message(chat_id, reminder_message, message_thread_id=message_thread_id)
 
 
 # --- File System Observer ---
@@ -1148,11 +1327,14 @@ def main():
                 
                 message = update['message']
                 chat_id = str(message['chat']['id'])
+                thread_id = message.get('message_thread_id')
+                if thread_id is not None:
+                    LAST_THREAD_ID[chat_id] = thread_id
                 
                 # --- Authorization Check ---
                 if chat_id != AUTHORIZED_USER_ID:
                     logging.warning(f"Unauthorized access attempt from Chat ID: {chat_id}")
-                    send_message(chat_id, "_You are not authorized to use this bot._")
+                    send_message(chat_id, "_You are not authorized to use this bot._", message_thread_id=thread_id)
                     continue
 
                 # --- Context Workflow Handler ---
@@ -1223,7 +1405,7 @@ def main():
                     continue
 
                 if 'voice' in message:
-                    handle_voice_message(message, state)
+                    handle_voice_message(message, state, message_thread_id=thread_id)
                     save_state(state)
                     continue
                     
@@ -1237,7 +1419,7 @@ def main():
                         if awaiting_input_type == "new_project_name":
                             project_name = text.strip()
                             if project_name:
-                                create_new_project(chat_id, project_name, state)
+                                create_new_project(chat_id, project_name, state, message_thread_id=thread_id)
                             else:
                                 send_message(chat_id, "Invalid project name. Operation cancelled.")
                             save_state(state)
@@ -1272,9 +1454,9 @@ def main():
                     continue
 
                 if text.startswith("/set_project") or text.startswith("/p"):
-                    handle_set_project(chat_id, text, state)
+                    handle_set_project(chat_id, text, state, message_thread_id=thread_id)
                 elif text.startswith("/new_project"):
-                    handle_new_project(chat_id, text, state)
+                    handle_new_project(chat_id, text, state, message_thread_id=thread_id)
                 elif text.startswith("/file") or text.startswith("/f"):
                     handle_get_file(chat_id, text, state)
                 elif text.startswith("/e"):
@@ -1291,9 +1473,9 @@ def main():
                     handle_context_command(chat_id, state)
                 elif text == "/current_project":
                     current_project = state["contexts"].get(chat_id, "None")
-                    send_message(chat_id, f"Current project is: `{current_project}`")
+                    send_message(chat_id, f"Current project is: `{current_project}`", message_thread_id=thread_id)
                 else:
-                    handle_gemini_prompt(chat_id, text, state)
+                    handle_gemini_prompt(chat_id, text, state, message_thread_id=thread_id)
 
                 save_state(state)
 
@@ -1309,18 +1491,18 @@ def main():
             logging.critical(f"An unhandled error occurred in the main loop: {e}", exc_info=True)
             time.sleep(10)
 
-def handle_voice_message(message, state):
+def handle_voice_message(message, state, message_thread_id=None):
     """Handles a voice message by transcribing it and passing it to Gemini."""
     chat_id = str(message['chat']['id'])
     project_context = state["contexts"].get(chat_id)
     if not project_context:
-        send_message(chat_id, "No project context set. Please use `/set_project <project_name>` first.")
+        send_message(chat_id, "No project context set. Please use `/set_project <project_name>` first.", message_thread_id=message_thread_id)
         return
 
     voice = message['voice']
     file_id = voice['file_id']
     
-    send_message(chat_id, "_Transcribing voice message..._")
+    send_message(chat_id, "_Transcribing voice message..._", message_thread_id=message_thread_id)
 
     try:
         # Get file path from Telegram
@@ -1360,21 +1542,21 @@ def handle_voice_message(message, state):
         response = client.recognize(config=config, audio=audio)
         
         if not response.results or not response.results[0].alternatives:
-            send_message(chat_id, "Could not understand the audio. Please try again.")
+            send_message(chat_id, "Could not understand the audio. Please try again.", message_thread_id=message_thread_id)
             return
 
         transcript = response.results[0].alternatives[0].transcript
         
         # Send transcript to user and process as a prompt
-        send_message(chat_id, f"Heard: \"_{transcript}_\"")
-        handle_gemini_prompt(chat_id, transcript, state)
+        send_message(chat_id, f"Heard: \"_{transcript}_\"", message_thread_id=message_thread_id)
+        handle_gemini_prompt(chat_id, transcript, state, message_thread_id=message_thread_id)
 
     except requests.exceptions.RequestException as e:
         logging.error(f"Error downloading voice file: {e}")
-        send_message(chat_id, "Error downloading voice file for transcription.")
+        send_message(chat_id, "Error downloading voice file for transcription.", message_thread_id=message_thread_id)
     except Exception as e:
         logging.error(f"An error occurred during speech-to-text: {e}", exc_info=True)
-        send_message(chat_id, "An error occurred during transcription.")
+        send_message(chat_id, "An error occurred during transcription.", message_thread_id=message_thread_id)
 
 if __name__ == "__main__":
     main()
