@@ -81,11 +81,12 @@ TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 # Streaming configuration
 STREAM_MODE = os.getenv("STREAM_MODE", "partial").lower()  # partial | block | off
-STREAM_UPDATE_INTERVAL = float(os.getenv("STREAM_UPDATE_INTERVAL", "1.5"))
+STREAM_UPDATE_INTERVAL = float(os.getenv("STREAM_UPDATE_INTERVAL", "0.5"))
 STREAM_MIN_CHARS = int(os.getenv("STREAM_MIN_CHARS", "200"))
 STREAM_MAX_CHARS = int(os.getenv("STREAM_MAX_CHARS", "800"))
 STREAM_TAIL_LIMIT = int(os.getenv("STREAM_TAIL_LIMIT", "3800"))
 STREAM_CURSOR = os.getenv("STREAM_CURSOR", " ▌")
+SHOW_STDERR = os.getenv("SHOW_STDERR", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 # --- Logging Setup ---
 
@@ -922,8 +923,8 @@ def run_gemini_streaming(chat_id, command, project_context, state, message_threa
     # Send initial "Thinking..." message
     message_id = send_message_with_id(
         chat_id,
-        "_Gemini is thinking..._",
-        parse_mode="Markdown",
+        "<i>Gemini is thinking...</i>",
+        parse_mode="HTML",
         message_thread_id=message_thread_id
     )
     if not message_id:
@@ -1047,7 +1048,7 @@ def run_gemini_streaming(chat_id, command, project_context, state, message_threa
 
         logging.info(f"Stream finished. Total length: {len(full_output)} chars. Total updates: {update_count}")
 
-        if stderr_output:
+        if stderr_output and SHOW_STDERR:
             full_output += f"\n\n--- STDERR ---\n{stderr_output}"
 
         # Final Cleanup and Formatting
@@ -1065,7 +1066,7 @@ def run_gemini_streaming(chat_id, command, project_context, state, message_threa
 
         if stream_mode == "block":
             maybe_update_block(time.time(), force_flush=True)
-            if stderr_output.strip():
+            if SHOW_STDERR and stderr_output.strip():
                 send_message(chat_id, f"--- STDERR ---\n{stderr_output}", "", message_thread_id=message_thread_id)
             return
 

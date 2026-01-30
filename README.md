@@ -62,7 +62,7 @@ Refine your `GEMINI.md` using the `/context` command for a high-quality project 
 Configure how the bot streams Gemini output back to Telegram:
 
 - `STREAM_MODE`: `partial` (edit one message), `block` (chunked messages), or `off`
-- `STREAM_UPDATE_INTERVAL`: seconds between edits (default `1.5`)
+- `STREAM_UPDATE_INTERVAL`: seconds between edits (default `0.5`)
 - `STREAM_MIN_CHARS`: minimum chars before updating in block mode (default `200`)
 - `STREAM_MAX_CHARS`: chunk size in block mode (default `800`)
 - `STREAM_TAIL_LIMIT`: max tail length in partial mode (default `3800`)
@@ -101,4 +101,3 @@ source venv/bin/activate    # On Windows, use: venv\Scripts\activate
 pip install -r requirements.txt
 
 ---
-
