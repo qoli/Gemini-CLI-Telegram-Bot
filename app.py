@@ -87,6 +87,8 @@ STREAM_MAX_CHARS = int(os.getenv("STREAM_MAX_CHARS", "800"))
 STREAM_TAIL_LIMIT = int(os.getenv("STREAM_TAIL_LIMIT", "3800"))
 STREAM_CURSOR = os.getenv("STREAM_CURSOR", " ▌")
 SHOW_STDERR = os.getenv("SHOW_STDERR", "0").strip().lower() in {"1", "true", "yes", "on"}
+ENABLE_CONTEXT_REMINDER = os.getenv("ENABLE_CONTEXT_REMINDER", "0").strip().lower() in {"1", "true", "yes", "on"}
+CONTEXT_REMINDER_EVERY = int(os.getenv("CONTEXT_REMINDER_EVERY", "5"))
 
 # --- Logging Setup ---
 
@@ -307,6 +309,18 @@ def edit_message_text(chat_id, message_id, text, parse_mode=None):
     except requests.exceptions.RequestException as e:
         logging.debug(f"Edit message request failed: {e}")
         return False
+
+def append_raw_log(section_title, content):
+    """Appends a raw section to the log file without altering formatting."""
+    if not content:
+        return
+    try:
+        with open(LOG_FILE, 'a', encoding='utf-8') as f:
+            f.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] {section_title}\n")
+            f.write(content)
+            f.write("\n")
+    except IOError as e:
+        logging.error(f"Could not append to log file {LOG_FILE}: {e}")
 
 def send_file(chat_id, file_path, message_thread_id=None):
     """Sends a file to a Telegram chat."""
@@ -1053,6 +1067,9 @@ def run_gemini_streaming(chat_id, command, project_context, state, message_threa
 
         # Final Cleanup and Formatting
         clean_output = ansi_escape.sub('', full_output)
+        append_raw_log("GEMINI CLI RESPONSE", clean_output)
+        if clean_output:
+            logging.info("GEMINI CLI RESPONSE:\n%s", clean_output)
         
         # Save to logs
         conversation_log_path = Path(project_context) / "project_conversation.log"
@@ -1183,8 +1200,8 @@ def handle_gemini_prompt(chat_id, text, state, message_thread_id=None):
     thread.daemon = True
     thread.start()
 
-    # Send periodic reminder
-    if prompt_counter % 5 == 0:
+    # Send periodic reminder (optional)
+    if ENABLE_CONTEXT_REMINDER and CONTEXT_REMINDER_EVERY > 0 and prompt_counter % CONTEXT_REMINDER_EVERY == 0:
         reminder_message = (
             f"You've sent {prompt_counter} requests for this project. To keep the requirements concise, "
             f"you may want to refine the context soon using the `/context` command."
